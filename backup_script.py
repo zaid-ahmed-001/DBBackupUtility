@@ -1,138 +1,200 @@
 import os
 import subprocess
 import time
+import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
 from discord_webhook import DiscordWebhook
 
-USE_GIT = False # Set to True to use git to store backups 
-# (if set to True, you need to have git installed on your system)
-# (if set to True, you need to have a remote repository set up)
-USE_DISCORD = True  # Set to True to send backups via Discord webhook
-
-db_user = ""  # Change this to your database username
-db_password = ""  # Change this to your database password
-db_name = "" # Change this to your database name
-export_dir = "" # Change this to your folder to store sql files
-webhook_url = ""  # Replace with your Discord webhook URL
-
-# Backup interval (in minutes) - set your desired time here
-backup_interval_hours = 1
-backup_interval_minutes =  backup_interval_hours * 60
-
-# Retention period for backups (in houts)
-retention_period_hours = 12
-
-# Create export directory if it doesn't exist
-if not os.path.exists(export_dir):
-    os.makedirs(export_dir)
-
-def cleanup_old_backups():
-    """Delete old backups older than the retention period."""
-    now = datetime.now()
-    cutoff_time = now - timedelta(hours=retention_period_hours)
-
-    for file_name in os.listdir(export_dir):
-        file_path = os.path.join(export_dir, file_name)
-        if os.path.isfile(file_path):
-            # Get the file's last modified time
-            file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
-            if file_mtime < cutoff_time:
-                try:
-                    os.remove(file_path)
-                    print(f"Deleted old backup: {file_path}")
-                except Exception as e:
-                    print(f"Error deleting file {file_path}: {e}")
-
-def create_backup():
-    """Creates a database backup and returns the file path."""
-    # Generate the filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_file = f"{export_dir}/{db_name}_{timestamp}.sql"
-
-    # Build the mysqldump command (SSL disabled)
-    command = [
-        "mysqldump",
-        "--ssl=0",
-        "-u", db_user,
-        f"--password={db_password}",
-        db_name
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('backup.log')
     ]
+)
 
-    try:
-        # Run mysqldump command to export the database
-        with open(export_file, "w") as output_file:
-            subprocess.run(command, stdout=output_file, check=True)
+@dataclass
+class BackupConfig:
+    """Store backup configuration settings"""
+    use_git: bool
+    use_discord: bool
+    db_user: str
+    db_password: str
+    db_name: str
+    export_dir: Path
+    webhook_url: Optional[str]
+    backup_interval_hours: int
+    retention_period_hours: int
 
-        print(f"Database exported successfully: {export_file}")
-        return export_file
-    except subprocess.CalledProcessError as e:
-        print(f"Error exporting database: {e}")
-        return None
-
-def send_to_discord(file_path):
-    """Sends the backup file to Discord via webhook."""
-    try:
-        webhook = DiscordWebhook(url=webhook_url, username="Database Exporter")
-        with open(file_path, "rb") as f:
-            webhook.add_file(file=f.read(), filename=os.path.basename(file_path))
-
-        response = webhook.execute()
-        if response.status_code == 200:
-            print("Database export sent to Discord successfully!")
-        else:
-            print(f"Failed to send database export to Discord: {response.status_code}")
-    except Exception as e:
-        print(f"Unexpected error sending to Discord: {e}")
-
-def commit_to_git(file_path):
-    """Commits the backup file to a Git repository and pushes the changes."""
-    try:
-        os.chdir(export_dir)  # Change directory to the backup folder
-
-        # Initialize the Git repository if not already initialized
-        if not os.path.exists(os.path.join(export_dir, ".git")):
-            subprocess.run(["git", "init"], check=True)
-            print("Initialized a new Git repository.")
+    @classmethod
+    def from_user_input(cls) -> 'BackupConfig':
+        """Create config from user input with validation"""
+        try:
+            use_git = input("Use Git for backups? (yes/no): ").lower().startswith('y')
+            use_discord = input("Use Discord webhook? (yes/no): ").lower().startswith('y')
             
-            # Add the remote repository if it's not set up
-            subprocess.run(["git", "remote", "add", "origin", "https://github.com/zaid-ahmed-001/DatabaseBackup-test"], check=True)
-            print("Remote repository added successfully.")
+            config = {
+                'use_git': use_git,
+                'use_discord': use_discord,
+                'db_user': input("Database username: ").strip(),
+                'db_password': input("Database password: ").strip(),
+                'db_name': input("Database name: ").strip(),
+                'export_dir': Path(input("Backup directory path: ").strip()),
+                'webhook_url': input("Discord webhook URL: ").strip() if use_discord else None,
+                'backup_interval_hours': int(input("Backup interval (hours): ")),
+                'retention_period_hours': int(input("Retention period (hours): "))
+            }
+            
+            # Validate inputs
+            if not config['db_user'] or not config['db_password'] or not config['db_name']:
+                raise ValueError("Database credentials cannot be empty")
+            
+            if config['backup_interval_hours'] <= 0 or config['retention_period_hours'] <= 0:
+                raise ValueError("Time intervals must be positive")
+                
+            return cls(**config)
+            
+        except ValueError as e:
+            logging.error(f"Configuration error: {e}")
+            raise
 
-        # Add the new backup file
-        subprocess.run(["git", "add", file_path], check=True)
+class DatabaseBackup:
+    """Handles database backup operations"""
+    
+    def __init__(self, config: BackupConfig):
+        self.config = config
+        self.git_repo_url = "https://github.com/zaid-ahmed-001/DatabaseBackup-test"
+        self._setup_export_directory()
 
-        # Commit the changes with a timestamp message
-        commit_message = f"Backup created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        subprocess.run(["git", "commit", "-m", commit_message], check=True)
-        print("Backup committed to Git successfully!")
+    def _setup_export_directory(self) -> None:
+        """Create export directory if it doesn't exist"""
+        self.config.export_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.config.use_git:
+            self._setup_git_repo()
 
-        # Push the changes to the remote repository
-        subprocess.run(["git", "push", "origin", "main"], check=True)  # Assuming 'main' as the default branch
-        print("Changes pushed to the remote Git repository successfully!")
+    def _setup_git_repo(self) -> None:
+        """Initialize and configure Git repository"""
+        try:
+            if not (self.config.export_dir / '.git').exists():
+                os.chdir(self.config.export_dir)
+                subprocess.run(['git', 'init'], check=True, capture_output=True)
+                subprocess.run(['git', 'remote', 'add', 'origin', self.git_repo_url], 
+                             check=True, capture_output=True)
+                subprocess.run(['git', 'pull', 'origin', 'main'], 
+                             check=True, capture_output=True)
+                logging.info("Git repository initialized successfully")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Git setup failed: {e.stderr.decode()}")
+            raise
 
-    except subprocess.CalledProcessError as e:
-        print(f"Error committing or pushing to Git: {e}")
+    def create_backup(self) -> Optional[Path]:
+        """Create database backup and return file path"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = self.config.export_dir / f"{self.config.db_name}_{timestamp}.sql"
+        
+        try:
+            command = [
+                "mysqldump",
+                "--ssl=0",
+                "-u", self.config.db_user,
+                f"--password={self.config.db_password}",
+                self.config.db_name
+            ]
+            
+            subprocess.run(command, stdout=backup_file.open('w'),
+                         check=True, capture_output=True)
+            logging.info(f"Backup created: {backup_file}")
+            return backup_file
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Backup failed: {e.stderr.decode()}")
+            return None
+
+    def send_to_discord(self, backup_file: Path) -> None:
+        """Send backup to Discord"""
+        if not self.config.use_discord or not self.config.webhook_url:
+            return
+            
+        try:
+            webhook = DiscordWebhook(
+                url=self.config.webhook_url,
+                username="Database Backup Bot"
+            )
+            
+            webhook.add_file(
+                file=backup_file.read_bytes(),
+                filename=backup_file.name
+            )
+            
+            response = webhook.execute()
+            if response.status_code == 200:
+                logging.info("Backup sent to Discord")
+            else:
+                logging.error(f"Discord webhook failed: {response.status_code}")
+                
+        except Exception as e:
+            logging.error(f"Discord upload failed: {e}")
+
+    def commit_to_git(self, backup_file: Path) -> None:
+        """Commit and push backup to Git"""
+        if not self.config.use_git:
+            return
+            
+        try:
+            os.chdir(self.config.export_dir)
+            subprocess.run(['git', 'add', backup_file], check=True, capture_output=True)
+            commit_msg = f"Backup created: {datetime.now().isoformat()}"
+            subprocess.run(['git', 'commit', '-m', commit_msg], check=True, capture_output=True)
+            subprocess.run(['git', 'push', 'origin', 'main'], check=True, capture_output=True)
+            logging.info("Backup pushed to Git")
+            
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Git operations failed: {e.stderr.decode()}")
+
+    def cleanup_old_backups(self) -> None:
+        """Remove backups older than retention period"""
+        cutoff_time = datetime.now() - timedelta(hours=self.config.retention_period_hours)
+        
+        for backup_file in self.config.export_dir.glob('*.sql'):
+            if backup_file.stat().st_mtime < cutoff_time.timestamp():
+                try:
+                    backup_file.unlink()
+                    logging.info(f"Deleted old backup: {backup_file}")
+                except Exception as e:
+                    logging.error(f"Cleanup failed for {backup_file}: {e}")
 
 def main():
-    while True:
-        print("Starting backup process...")
-
-        # Create a backup
-        backup_file = create_backup()
-
-        if backup_file:
-            # Choose where to store the backup
-            if USE_GIT:
-                commit_to_git(backup_file)
-            if USE_DISCORD:
-                send_to_discord(backup_file)
-
-            # Cleanup old backups
-            print("Cleaning up old backups...")
-            cleanup_old_backups()
-
-        print(f"Waiting {backup_interval_minutes} minutes for the next backup...")
-        time.sleep(backup_interval_minutes * 60)  # Convert minutes to seconds
+    """Main backup routine"""
+    try:
+        config = BackupConfig.from_user_input()
+        backup_manager = DatabaseBackup(config)
+        
+        while True:
+            logging.info("Starting backup process...")
+            
+            if backup_file := backup_manager.create_backup():
+                if config.use_git:
+                    backup_manager.commit_to_git(backup_file)
+                if config.use_discord:
+                    backup_manager.send_to_discord(backup_file)
+                    
+                backup_manager.cleanup_old_backups()
+                
+            wait_minutes = config.backup_interval_hours * 60
+            logging.info(f"Waiting {wait_minutes} minutes until next backup...")
+            time.sleep(wait_minutes * 60)
+            
+    except KeyboardInterrupt:
+        logging.info("Backup process stopped by user")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
